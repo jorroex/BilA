@@ -49,26 +49,51 @@ else:
     except Exception:
         pass
 
-# Límite de Telegram para sendPhoto: 10 MB
 MAX_TG_PHOTO = 10 * 1024 * 1024  # 10 MiB
 
 # Directorio de modelos
 MODEL_DIR = os.path.join("experiments", "pretrained_models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+# --- Descarga robusta con fallback ---
+def download_with_fallback(urls, dest_path):
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    last_err = None
+    for u in urls:
+        try:
+            print(f"⬇️ Descargando: {u}")
+            urllib.request.urlretrieve(u, dest_path)
+            print("✅ Descargado en:", dest_path)
+            return True
+        except Exception as e:
+            print(f"⚠️ Falló {u}: {e}")
+            last_err = e
+    if last_err:
+        raise last_err
+    return False
+
 # Registro de modelos disponibles
 MODEL_REGISTRY = {
     # Anime => RRDBNet con 6 bloques
     "anime": {
         "path": os.path.join(MODEL_DIR, "RealESRGAN_x4plus_anime_6B.pth"),
-        "url":  "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        "urls": [
+            # Release correcto del anime
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
+        ],
         "rrdb_blocks": 6,
         "desc": "Anime x4 (6 bloques RRDB)"
     },
     # Realista/fotos => RRDBNet con 23 bloques
     "real": {
         "path": os.path.join(MODEL_DIR, "RealESRGAN_x4plus.pth"),
-        "url":  "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus.pth",
+        "urls": [
+            # ⚠️ Release correcto para x4plus general: v0.1.0 (el de v0.2.2.4 da 404)
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+            # Fallbacks típicos (mirrors de HF):
+            "https://huggingface.co/lllyasviel/Annotators/resolve/main/RealESRGAN_x4plus.pth",
+            "https://huggingface.co/Marne/Real-ESRGAN/resolve/main/RealESRGAN_x4plus.pth",
+        ],
         "rrdb_blocks": 23,
         "desc": "Real x4 (23 bloques RRDB)"
     },
@@ -76,7 +101,7 @@ MODEL_REGISTRY = {
 
 DEFAULT_MODEL = "anime"
 
-# Estrategia de tiles (por dispositivo)
+# Estrategia de tiles
 TILE_CAND_GPU = [400, 300, 200, 120, 100, 60]
 TILE_CAND_CPU = [0, 200, 120, 100, 60]
 TILE_CANDIDATES = TILE_CAND_GPU if DEVICE == "cuda" else TILE_CAND_CPU
@@ -91,8 +116,7 @@ def _ensure_model_file(model_key: str):
     info = MODEL_REGISTRY[model_key]
     if not os.path.exists(info["path"]):
         print(f"⬇️ Descargando modelo {model_key}…")
-        urllib.request.urlretrieve(info["url"], info["path"])
-        print(f"✅ Modelo descargado: {info['path']}")
+        download_with_fallback(info["urls"], info["path"])
 
 def _build_rrdb(model_key: str) -> RRDBNet:
     blocks = MODEL_REGISTRY[model_key]["rrdb_blocks"]
@@ -160,7 +184,7 @@ async def start_progress(context: ContextTypes.DEFAULT_TYPE, chat_id: int, heade
     return msg, stop, task
 
 # ===============================
-# 4) Handlers de comandos
+# 4) Comandos
 # ===============================
 def _get_chat_model(chat_id: int) -> str:
     return _CHAT_MODEL.get(chat_id, DEFAULT_MODEL)
@@ -169,15 +193,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     current = _get_chat_model(chat_id)
     text = (
-        "📘 *Ayuda del bot*\n\n"
+        "📘 *Ayuda*\n\n"
         "• Envíame una *foto* y la mejoraré ×4 con Real-ESRGAN.\n"
-        "• Cambia el modelo en caliente:\n"
-        "   • `/anime`  – modelo Anime (nítido, líneas)\n"
-        "   • `/real`   – modelo Real (fotos)\n"
-        "• `/status` – ver el modelo activo en este chat.\n\n"
+        "• Cambia el modelo:\n"
+        "   • `/anime` – Anime (nítido, líneas)\n"
+        "   • `/real`  – Real/fotos (23 bloques)\n"
+        "• `/status` – ver modelo activo.\n\n"
         f"🔧 Modelo actual: *{current}* — {MODEL_REGISTRY[current]['desc']}"
     )
     await update.message.reply_markdown(text)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_help(update, context)
 
 async def cmd_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _CHAT_MODEL[update.effective_chat.id] = "anime"
@@ -213,9 +240,9 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         tg_file = await context.bot.get_file(update.message.photo[-1].file_id)
         input_path  = f"input_{uuid.uuid4().hex}.jpg"
-        output_path = f"output_{uuid.uuid4().hex}.png"  # siempre PNG de alta calidad
+        output_path = f"output_{uuid.uuid4().hex}.png"  # siempre PNG
 
-        # Barra de progreso (sin mencionar CUDA ni tile)
+        # Barra de progreso (sin CUDA/tile en el texto)
         progress_msg, stop_event, progress_task = await start_progress(context, chat_id)
 
         await tg_file.download_to_drive(input_path)
@@ -234,7 +261,7 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Guardar PNG (máxima calidad)
         cv2.imwrite(output_path, result)
 
-        # Enviar: si PNG <= 10MB -> photo; si no -> document (sin recomprimir)
+        # Enviar: <=10MB -> photo; >10MB -> document (sin recomprimir)
         size_png = os.path.getsize(output_path)
         if size_png <= MAX_TG_PHOTO:
             with open(output_path, "rb") as f:
@@ -248,7 +275,6 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except Exception as e:
-        # Mensaje genérico si algo inesperado ocurre
         try:
             await update.message.reply_text(f"⚠️ Error inesperado:\n{str(e)}")
         except Exception:
@@ -270,7 +296,7 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
         except Exception:
             pass
-        # Limpieza de temporales
+        # Limpieza
         for p in (input_path, output_path):
             try:
                 if p and os.path.exists(p):
@@ -289,6 +315,7 @@ def main():
 
     # Comandos
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("anime", cmd_anime))
     app.add_handler(CommandHandler("real", cmd_real))
     app.add_handler(CommandHandler("status", cmd_status))
